@@ -15,7 +15,7 @@ pub struct SetRewardEmissions<'info> {
     #[account(mut)]
     pub whirlpool: Account<'info, Whirlpool>,
 
-    #[account(address = whirlpool.reward_infos[reward_index as usize].authority)]
+    #[account(address = whirlpool.reward_authority())]
     pub reward_authority: Signer<'info>,
 
     #[account(address = whirlpool.reward_infos[reward_index as usize].vault)]
@@ -26,7 +26,7 @@ pub fn handler(
     ctx: Context<SetRewardEmissions>,
     reward_index: u8,
     emissions_per_second_x64: u128,
-) -> ProgramResult {
+) -> Result<()> {
     let whirlpool = &ctx.accounts.whirlpool;
     let reward_vault = &ctx.accounts.reward_vault;
 
@@ -39,10 +39,10 @@ pub fn handler(
     let timestamp = to_timestamp_u64(clock.unix_timestamp)?;
     let next_reward_infos = next_whirlpool_reward_infos(whirlpool, timestamp)?;
 
-    Ok(ctx.accounts.whirlpool.update_emissions(
+    ctx.accounts.whirlpool.update_emissions(
         reward_index as usize,
         next_reward_infos,
         timestamp,
         emissions_per_second_x64,
-    )?)
+    )
 }

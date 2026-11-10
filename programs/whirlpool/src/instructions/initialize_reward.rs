@@ -1,12 +1,11 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Mint, Token};
 
-use crate::state::Whirlpool;
+use crate::{state::Whirlpool, util::initialize_vault_token_account};
 
 #[derive(Accounts)]
-#[instruction(reward_index: u8)]
 pub struct InitializeReward<'info> {
-    #[account(address = whirlpool.reward_infos[reward_index as usize].authority)]
+    #[account(address = whirlpool.reward_authority())]
     pub reward_authority: Signer<'info>,
 
     #[account(mut)]
@@ -17,13 +16,9 @@ pub struct InitializeReward<'info> {
 
     pub reward_mint: Box<Account<'info, Mint>>,
 
-    #[account(
-        init,
-        payer = funder,
-        token::mint = reward_mint,
-        token::authority = whirlpool
-    )]
-    pub reward_vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: initialized in the handler
+    #[account(mut)]
+    pub reward_vault: Signer<'info>,
 
     #[account(address = token::ID)]
     pub token_program: Program<'info, Token>,
@@ -31,12 +26,21 @@ pub struct InitializeReward<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-pub fn handler(ctx: Context<InitializeReward>, reward_index: u8) -> ProgramResult {
+pub fn handler(ctx: Context<InitializeReward>, reward_index: u8) -> Result<()> {
     let whirlpool = &mut ctx.accounts.whirlpool;
 
-    Ok(whirlpool.initialize_reward(
+    initialize_vault_token_account(
+        whirlpool,
+        &ctx.accounts.reward_vault,
+        &ctx.accounts.reward_mint.to_account_info(),
+        &ctx.accounts.funder,
+        &ctx.accounts.token_program,
+        &ctx.accounts.system_program,
+    )?;
+
+    whirlpool.initialize_reward(
         reward_index as usize,
         ctx.accounts.reward_mint.key(),
         ctx.accounts.reward_vault.key(),
-    )?)
+    )
 }

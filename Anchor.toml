@@ -1,3 +1,7 @@
+# Anchor configuration for Whirlpool program
+# Note: Tests now use LiteSVM instead of Anchor's test validator.
+# External programs and preloaded accounts are configured in litesvm.ts.
+
 [programs.localnet]
 whirlpool = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
 
@@ -7,11 +11,3 @@ url = "https://anchor.projectserum.com"
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
-
-# wait for update to anchor to support cloning
-# [[test.genesis]]
-# address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-# program = "../metaplex-program-library/token-metadata/target/deploy/mpl_token_metadata.so"
-
-[scripts]
-test = "ts-mocha -p sdk/tests/tsconfig.json -t 1000000 sdk/tests/**/*.test.ts"

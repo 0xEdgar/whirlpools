@@ -19,45 +19,12 @@
 /// U256 reference:
 /// https://crates.parity.io/sp_core/struct.U256.html
 ///
-use borsh::{BorshDeserialize, BorshSerialize};
 use std::borrow::BorrowMut;
 use std::convert::TryInto;
-use std::io::{Error, ErrorKind, Write};
 use std::mem::size_of;
 use uint::construct_uint;
 
 use crate::errors::ErrorCode;
-
-macro_rules! impl_borsh_serialize_for_bn {
-    ($type: ident) => {
-        impl BorshSerialize for $type {
-            #[inline]
-            fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-                let bytes = self.to_le_bytes();
-                writer.write_all(&bytes)
-            }
-        }
-    };
-}
-
-macro_rules! impl_borsh_deserialize_for_bn {
-    ($type: ident) => {
-        impl BorshDeserialize for $type {
-            #[inline]
-            fn deserialize(buf: &mut &[u8]) -> std::io::Result<Self> {
-                if buf.len() < size_of::<$type>() {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        "Unexpected length of input",
-                    ));
-                }
-                let res = $type::from_le_bytes(buf[..size_of::<$type>()].try_into().unwrap());
-                *buf = &buf[size_of::<$type>()..];
-                Ok(res)
-            }
-        }
-    };
-}
 
 construct_uint! {
     // U256 of [u64; 4]
@@ -87,9 +54,6 @@ impl U256 {
     }
 }
 
-impl_borsh_deserialize_for_bn!(U256);
-impl_borsh_serialize_for_bn!(U256);
-
 #[cfg(test)]
 mod test_u256 {
     use super::*;
@@ -109,7 +73,7 @@ mod test_u256 {
         let b = U256::from(u128::MAX);
         let sum = a + b;
         let c: Result<u128, ErrorCode> = sum.try_into_u128();
-        assert_eq!(c.is_err(), true);
+        assert!(c.is_err());
     }
 
     #[test]
@@ -145,7 +109,7 @@ mod test_u256 {
         let b = U256::from(u64::MAX);
         let sum = a + b;
         let c: Result<u64, ErrorCode> = sum.try_into_u64();
-        assert_eq!(c.is_err(), true);
+        assert!(c.is_err());
     }
 
     #[test]

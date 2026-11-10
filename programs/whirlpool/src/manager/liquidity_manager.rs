@@ -1,5 +1,6 @@
 use super::{
     position_manager::next_position_modify_liquidity_update,
+    tick_array_manager::{calculate_modify_tick_array, TickArrayUpdate},
     tick_manager::{
         next_fee_growths_inside, next_reward_growths_inside, next_tick_modify_liquidity_update,
     },
@@ -10,7 +11,7 @@ use crate::{
     math::{get_amount_delta_a, get_amount_delta_b, sqrt_price_from_tick_index},
     state::*,
 };
-use anchor_lang::prelude::{AccountLoader, ProgramError};
+use anchor_lang::prelude::*;
 
 #[derive(Debug)]
 pub struct ModifyLiquidityUpdate {
@@ -19,6 +20,8 @@ pub struct ModifyLiquidityUpdate {
     pub tick_upper_update: TickUpdate,
     pub reward_infos: [WhirlpoolRewardInfo; NUM_REWARDS],
     pub position_update: PositionUpdate,
+    pub tick_array_lower_update: TickArrayUpdate,
+    pub tick_array_upper_update: TickArrayUpdate,
 }
 
 // Calculates state after modifying liquidity by the liquidity_delta for the given positon.
@@ -27,43 +30,41 @@ pub struct ModifyLiquidityUpdate {
 pub fn calculate_modify_liquidity<'info>(
     whirlpool: &Whirlpool,
     position: &Position,
-    tick_array_lower: &AccountLoader<'info, TickArray>,
-    tick_array_upper: &AccountLoader<'info, TickArray>,
+    tick_array_lower: &dyn TickArrayType,
+    tick_array_upper: &dyn TickArrayType,
     liquidity_delta: i128,
     timestamp: u64,
-) -> Result<ModifyLiquidityUpdate, ProgramError> {
-    let tick_array_lower = tick_array_lower.load()?;
+) -> Result<ModifyLiquidityUpdate> {
     let tick_lower =
         tick_array_lower.get_tick(position.tick_lower_index, whirlpool.tick_spacing)?;
 
-    let tick_array_upper = tick_array_upper.load()?;
     let tick_upper =
         tick_array_upper.get_tick(position.tick_upper_index, whirlpool.tick_spacing)?;
 
-    Ok(_calculate_modify_liquidity(
+    _calculate_modify_liquidity(
         whirlpool,
         position,
-        tick_lower,
-        tick_upper,
+        &tick_lower,
+        &tick_upper,
         position.tick_lower_index,
         position.tick_upper_index,
+        tick_array_lower.is_variable_size(),
+        tick_array_upper.is_variable_size(),
         liquidity_delta,
         timestamp,
-    )?)
+    )
 }
 
 pub fn calculate_fee_and_reward_growths<'info>(
     whirlpool: &Whirlpool,
     position: &Position,
-    tick_array_lower: &AccountLoader<'info, TickArray>,
-    tick_array_upper: &AccountLoader<'info, TickArray>,
+    tick_array_lower: &dyn TickArrayType,
+    tick_array_upper: &dyn TickArrayType,
     timestamp: u64,
-) -> Result<(PositionUpdate, [WhirlpoolRewardInfo; NUM_REWARDS]), ProgramError> {
-    let tick_array_lower = tick_array_lower.load()?;
+) -> Result<(PositionUpdate, [WhirlpoolRewardInfo; NUM_REWARDS])> {
     let tick_lower =
         tick_array_lower.get_tick(position.tick_lower_index, whirlpool.tick_spacing)?;
 
-    let tick_array_upper = tick_array_upper.load()?;
     let tick_upper =
         tick_array_upper.get_tick(position.tick_upper_index, whirlpool.tick_spacing)?;
 
@@ -72,10 +73,12 @@ pub fn calculate_fee_and_reward_growths<'info>(
     let update = _calculate_modify_liquidity(
         whirlpool,
         position,
-        tick_lower,
-        tick_upper,
+        &tick_lower,
+        &tick_upper,
         position.tick_lower_index,
         position.tick_upper_index,
+        tick_array_lower.is_variable_size(),
+        tick_array_upper.is_variable_size(),
         0,
         timestamp,
     )?;
@@ -83,6 +86,7 @@ pub fn calculate_fee_and_reward_growths<'info>(
 }
 
 // Calculates the state changes after modifying liquidity of a whirlpool position.
+#[allow(clippy::too_many_arguments)]
 fn _calculate_modify_liquidity(
     whirlpool: &Whirlpool,
     position: &Position,
@@ -90,9 +94,11 @@ fn _calculate_modify_liquidity(
     tick_upper: &Tick,
     tick_lower_index: i32,
     tick_upper_index: i32,
+    tick_array_lower_variable_size: bool,
+    tick_array_upper_variable_size: bool,
     liquidity_delta: i128,
     timestamp: u64,
-) -> Result<ModifyLiquidityUpdate, ErrorCode> {
+) -> Result<ModifyLiquidityUpdate> {
     // Disallow only updating position fee and reward growth when position has zero liquidity
     if liquidity_delta == 0 && position.liquidity == 0 {
         return Err(ErrorCode::LiquidityZero.into());
@@ -156,12 +162,30 @@ fn _calculate_modify_liquidity(
         &reward_growths_inside,
     )?;
 
+    let tick_array_lower_update = calculate_modify_tick_array(
+        position,
+        &position_update,
+        tick_array_lower_variable_size,
+        tick_lower,
+        &tick_lower_update,
+    )?;
+
+    let tick_array_upper_update = calculate_modify_tick_array(
+        position,
+        &position_update,
+        tick_array_upper_variable_size,
+        tick_upper,
+        &tick_upper_update,
+    )?;
+
     Ok(ModifyLiquidityUpdate {
         whirlpool_liquidity: next_global_liquidity,
         reward_infos: next_reward_infos,
         position_update,
         tick_lower_update,
         tick_upper_update,
+        tick_array_lower_update,
+        tick_array_upper_update,
     })
 }
 
@@ -170,7 +194,7 @@ pub fn calculate_liquidity_token_deltas(
     sqrt_price: u128,
     position: &Position,
     liquidity_delta: i128,
-) -> Result<(u64, u64), ErrorCode> {
+) -> Result<(u64, u64)> {
     if liquidity_delta == 0 {
         return Err(ErrorCode::LiquidityZero.into());
     }
@@ -178,7 +202,7 @@ pub fn calculate_liquidity_token_deltas(
     let mut delta_a: u64 = 0;
     let mut delta_b: u64 = 0;
 
-    let liquidity: u128 = liquidity_delta.abs() as u128;
+    let liquidity: u128 = liquidity_delta.unsigned_abs();
     let round_up = liquidity_delta > 0;
 
     let lower_price = sqrt_price_from_tick_index(position.tick_lower_index);
@@ -202,24 +226,33 @@ pub fn calculate_liquidity_token_deltas(
 pub fn sync_modify_liquidity_values<'info>(
     whirlpool: &mut Whirlpool,
     position: &mut Position,
-    tick_array_lower: &AccountLoader<'info, TickArray>,
-    tick_array_upper: &AccountLoader<'info, TickArray>,
-    modify_liquidity_update: ModifyLiquidityUpdate,
+    tick_array_lower: &mut dyn TickArrayType,
+    tick_array_upper: Option<&mut dyn TickArrayType>,
+    modify_liquidity_update: &ModifyLiquidityUpdate,
     reward_last_updated_timestamp: u64,
-) -> Result<(), ProgramError> {
+) -> Result<()> {
     position.update(&modify_liquidity_update.position_update);
 
-    tick_array_lower.load_mut()?.update_tick(
+    tick_array_lower.update_tick(
         position.tick_lower_index,
         whirlpool.tick_spacing,
         &modify_liquidity_update.tick_lower_update,
     )?;
 
-    tick_array_upper.load_mut()?.update_tick(
-        position.tick_upper_index,
-        whirlpool.tick_spacing,
-        &modify_liquidity_update.tick_upper_update,
-    )?;
+    if let Some(tick_array_upper) = tick_array_upper {
+        tick_array_upper.update_tick(
+            position.tick_upper_index,
+            whirlpool.tick_spacing,
+            &modify_liquidity_update.tick_upper_update,
+        )?;
+    } else {
+        // Upper and lower tick arrays are the same so we only have one ref
+        tick_array_lower.update_tick(
+            position.tick_upper_index,
+            whirlpool.tick_spacing,
+            &modify_liquidity_update.tick_upper_update,
+        )?;
+    }
 
     whirlpool.update_rewards_and_liquidity(
         modify_liquidity_update.reward_infos,
@@ -267,6 +300,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 0,
                 100,
             )
@@ -295,6 +330,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -10,
                 100,
             )
@@ -323,6 +360,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -10,
                 100,
             )
@@ -351,6 +390,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -10,
                 100,
             )
@@ -392,6 +433,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -445,6 +488,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -522,6 +567,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     300,
                 )
@@ -587,6 +634,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -640,6 +689,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -702,6 +753,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -757,6 +810,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -829,6 +884,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     200,
                 )
@@ -897,6 +954,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -954,6 +1013,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1017,6 +1078,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1073,6 +1136,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1141,6 +1206,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1203,7 +1270,6 @@ mod calculate_modify_liquidity_unit_tests {
                         fee_growth_outside_b: to_x64(20),
                         // 2 = (1 + (100/100)) - 0
                         reward_growths_outside: create_reward_growths(to_x64(2)),
-                        ..Default::default()
                     }
                 );
 
@@ -1240,6 +1306,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     400,
                 )
@@ -1258,7 +1326,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_growth_checkpoint_b: to_x64(5),
                             fee_owed_b: 150,
                             reward_infos: create_position_reward_infos(
-                                340282366920938463460300150086149952853,
+                                // partial checkpoint adjustment: 340282366920938463459685258617026301133 = ceiling(to_x64(8) / 10) + 340282366920938463444927863358058659840 (previous checkpoint)
+                                340282366920938463459685258617026301133,
                                 // 8 = 0.83 * 10
                                 8,
                             ),
@@ -1308,6 +1377,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1365,6 +1436,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     100,
                 )
@@ -1433,6 +1506,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     10,
                     300,
                 )
@@ -1500,6 +1575,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1536,6 +1613,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1601,6 +1680,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     40_000,
                 )
@@ -1665,6 +1746,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1708,6 +1791,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1767,6 +1852,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1803,6 +1890,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     -10,
                     100,
                 )
@@ -1858,6 +1947,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 0,
                 100,
             )
@@ -1907,6 +1998,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 0,
                 100,
             )
@@ -1960,6 +2053,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 0,
                 100,
             )
@@ -2010,6 +2105,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 10,
                 100,
             )
@@ -2059,6 +2156,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 10,
                 100,
             )
@@ -2112,6 +2211,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 10,
                 100,
             )
@@ -2162,6 +2263,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -5,
                 100,
             )
@@ -2211,6 +2314,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -5,
                 100,
             )
@@ -2264,6 +2369,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -5,
                 100,
             )
@@ -2333,6 +2440,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 100,
                 100,
             )
@@ -2361,6 +2470,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 50,
                 200,
             )
@@ -2390,6 +2501,8 @@ mod calculate_modify_liquidity_unit_tests {
                 &test.tick_upper,
                 test.position.tick_lower_index,
                 test.position.tick_upper_index,
+                false,
+                false,
                 -150,
                 300,
             )
@@ -2460,6 +2573,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -2524,6 +2639,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -2542,7 +2659,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_owed_a: 20000,
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -2590,6 +2708,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -2648,6 +2768,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -2666,7 +2788,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_owed_a: 20000,
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -2714,6 +2837,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -2783,6 +2908,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -2801,7 +2928,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_owed_a: 20000,
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -2850,6 +2978,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -2904,6 +3034,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -2922,7 +3054,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_owed_a: 90000,
                             fee_growth_checkpoint_b: to_x64(90),
                             fee_owed_b: 90000,
-                            reward_infos: create_position_reward_infos(67079069358943824058, 3636),
+                            // partial checkpoint adjustment: 67072361452007929676 = ceiling(to_x64(3636) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(67072361452007929676, 3636),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -2969,6 +3102,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -3020,6 +3155,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -3087,6 +3224,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -3150,6 +3289,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -3220,6 +3361,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -3283,6 +3426,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -3303,7 +3448,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
                             // 0.909 = 0.909 - (-3) - (0.909 - -2.0909)
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -3355,6 +3501,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -3412,6 +3560,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -3430,7 +3580,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_owed_a: 20000,
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
@@ -3482,6 +3633,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     1000,
                     100,
                 )
@@ -3550,6 +3703,8 @@ mod calculate_modify_liquidity_unit_tests {
                     &test.tick_upper,
                     test.position.tick_lower_index,
                     test.position.tick_upper_index,
+                    false,
+                    false,
                     0,
                     600,
                 )
@@ -3570,7 +3725,8 @@ mod calculate_modify_liquidity_unit_tests {
                             fee_growth_checkpoint_b: to_x64(20),
                             fee_owed_b: 20000,
                             // 0.909 = 0.909 - (-4) - (0.909 - (-3.0909))
-                            reward_infos: create_position_reward_infos(16769767339735956014, 909),
+                            // partial checkpoint adjustment: 16768090363001982419 = ceiling(to_x64(909) / 1000) + 0 (previous checkpoint)
+                            reward_infos: create_position_reward_infos(16768090363001982419, 909),
                         },
                         tick_lower_update: TickUpdate {
                             initialized: true,
